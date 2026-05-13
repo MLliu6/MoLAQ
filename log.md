@@ -12,3 +12,11 @@
 - 创建 `tests/test_knapsack.py` sanity check。
 - 建立 git 仓库，完成初始提交。
 - **下一步**：补全 GPTQ baseline 评测数据，建立 FP16/AWQ/GPTQ/FP8 四组结果表（Table 1雏形）。
+## 2026-05-13
+
+- 项目初始化：在 `/home/lml/MoLAQ` 下建立完整目录骨架与 git 仓库。
+- 核心算法骨架已创建：hessian.py / saliency.py / modal_gradient.py / knapsack.py / budget.py。
+- README.md 完成（含数学形式化和Quick Start）。
+- sanity check 脚本 tests/test_knapsack.py 已就绪。
+- 完成首次 git commit，推送至 GitHub 备份。
+- **下一步**：运行 test_knapsack.py 验证分配器，然后优先补全 GPTQ baseline 评测结果。
