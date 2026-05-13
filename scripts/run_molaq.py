@@ -21,6 +21,10 @@ scripts/run_molaq.py — MoLAQ 主调脚本
   --enable_A  : 创新点 A（加权 Hessian + GPTQ）
   --enable_B  : 创新点 B（显著 token 缩放搜索）
 
+校准数据：
+  Flickr30k 的 test-*.parquet 文件，每个样本含真实 caption。
+  图像字段可能是 PIL.Image、{'path':...} 或 {'bytes':...} 三种格式。
+
 层名说明（Qwen3-VL-2B 实测）：
   LLM 侧 Linear 层前缀为 model.language_model.layers（不是 model.layers）
   ViT 侧 Linear 层前缀为 model.visual.blocks
@@ -30,12 +34,13 @@ scripts/run_molaq.py — MoLAQ 主调脚本
 import argparse
 import json
 import os
-from pathlib import Path
+from io import BytesIO
 from typing import Dict, List, Tuple
 
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from PIL import Image
 
@@ -49,76 +54,163 @@ from molaq.assign.knapsack        import greedy_bit_allocation, estimate_delta
 
 
 # ─────────────────────────────────────────────────────────────
+# 校准数据加载（改自 AWQ 参考脚本，支持 parquet 格式）
+# ─────────────────────────────────────────────────────────────
+
+def resolve_image_from_field(image_field, data_dir: str, filename=None) -> Image.Image:
+    """
+    从 parquet 的 image 字段恢复 PIL.Image：
+    1. 若已是 PIL.Image（datasets 自动解码），直接转成 RGB 返回。
+    2. 若是 dict 且含 'path'，按路径读取磁盘图片。
+    3. 若是 dict 且含 'bytes'，从 bytes 反序列化。
+    """
+    if isinstance(image_field, Image.Image):
+        return image_field.convert("RGB")
+
+    if isinstance(image_field, dict) and image_field.get("path") is not None:
+        raw_path = str(image_field["path"])
+        candidates = (
+            [raw_path] if os.path.isabs(raw_path)
+            else [
+                os.path.join(data_dir, raw_path),
+                os.path.join(os.path.dirname(data_dir), raw_path),
+            ]
+        )
+        for p in candidates:
+            if os.path.exists(p):
+                return Image.open(p).convert("RGB")
+
+    if isinstance(image_field, dict) and image_field.get("bytes") is not None:
+        return Image.open(BytesIO(image_field["bytes"])).convert("RGB")
+
+    raise ValueError(
+        f"Cannot resolve image from field of type {type(image_field)}, "
+        f"keys={list(image_field.keys()) if isinstance(image_field, dict) else None}, "
+        f"filename={filename}"
+    )
+
+
+class Flickr30kParquetDataset(Dataset):
+    """
+    从 flickr30k 的 test-*.parquet 文件加载校准数据。
+    每个样本含真实图片（PIL.Image / bytes / path 三种格式均支持）
+    和真实 caption（取第一条），构造 Qwen3-VL 模式的 messages。
+    """
+    def __init__(
+        self,
+        data_dir:  str,
+        processor,
+        n_samples: int = 128,
+        seed:      int = 42,
+        max_seq_len: int = 2048,
+    ):
+        self.processor   = processor
+        self.data_dir    = data_dir
+        self.max_seq_len = max_seq_len
+
+        if not os.path.isdir(data_dir):
+            raise FileNotFoundError(f"Flickr30k 数据目录不存在: {data_dir}")
+
+        ds = load_dataset(
+            "parquet",
+            data_dir=data_dir,
+            data_files={"train": "test-*.parquet"},
+        )["train"]
+        ds = ds.shuffle(seed=seed)
+        ds = ds.select(range(min(n_samples, len(ds))))
+        self.samples = ds
+        print(f"[MoLAQ] Flickr30k 加载完毕，实际样本数: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        example = self.samples[idx]
+
+        # ── 图像 ─────────────────────────────────────────
+        image = resolve_image_from_field(
+            example["image"],
+            data_dir=self.data_dir,
+            filename=example.get("filename"),
+        )
+
+        # ── Caption：取第一条 ──────────────────────────────
+        caption_field = example.get("caption")
+        if caption_field is None:
+            raise ValueError(f"Flickr30k 样本缺少 'caption' 字段")
+        if isinstance(caption_field, (list, tuple)):
+            caption_text = str(caption_field[0])
+        else:
+            try:
+                caption_text = str(caption_field[0])
+            except Exception:
+                caption_text = str(caption_field)
+
+        # ── 构造 Qwen3-VL 多模态 messages ────────────────────
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text": caption_text},
+            ],
+        }]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=False,
+            truncation=True,
+            max_length=self.max_seq_len,
+            add_special_tokens=False,
+            add_generation_prompt=False,
+        )
+        inputs.pop("token_type_ids", None)  # Qwen3-VL 不需要
+
+        if "pixel_values" not in inputs:
+            raise ValueError(
+                f"样本 {idx} 的 processor 输出缺少 pixel_values，请检查 messages 构造"
+            )
+        if "image_grid_thw" not in inputs:
+            raise ValueError(
+                f"样本 {idx} 的 processor 输出缺少 image_grid_thw"
+            )
+
+        return {
+            "input_ids":      inputs["input_ids"].squeeze(0),       # [seq_len]
+            "pixel_values":   inputs["pixel_values"].squeeze(0),    # [N_patches, C*p*p] 或类似
+            "image_grid_thw": inputs["image_grid_thw"].squeeze(0),  # [3]
+        }
+
+
+def collate_fn(batch):
+    """
+    batch_size=1 的 collate。
+    重新加回 batch 维度，确保 downstream 的 shape 一致。
+    """
+    assert len(batch) == 1, "校准 DataLoader 必须 batch_size=1"
+    return {
+        "input_ids":      batch[0]["input_ids"].unsqueeze(0),       # [1, seq_len]
+        "pixel_values":   batch[0]["pixel_values"].unsqueeze(0),    # [1, ...]
+        "image_grid_thw": batch[0]["image_grid_thw"].unsqueeze(0),  # [1, 3]
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────────────────────
 
 def get_linear_layers(model) -> List[Tuple[str, torch.nn.Module]]:
     """
     返回 LLM 侧所有 nn.Linear 层的 (name, module) 列表。
-
-    Qwen3-VL-2B 实测层名前缀为 model.language_model.layers，
-    共 196 个 Linear 层（已由 test_vit_attention.py 确认）。
-    不对 ViT 做量化（ViT 层前缀为 model.visual.blocks）。
+    Qwen3-VL-2B 实测层名前缀为 model.language_model.layers，共 196 个。
     """
     result = []
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear) and "model.language_model.layers" in name:
             result.append((name, module))
     return result
-
-
-class Flickr30kCalibDataset(Dataset):
-    """
-    最小校准集 Dataset，从 flickr30k 目录加载图片，使用固定 caption。
-    实际使用时可替换为真实的 image-caption 对。
-    """
-    def __init__(self, data_dir: str, processor, n_samples: int = 128):
-        self.processor  = processor
-        self.n_samples  = n_samples
-        img_extensions  = {".jpg", ".jpeg", ".png"}
-        all_imgs = sorted([
-            p for p in Path(data_dir).rglob("*")
-            if p.suffix.lower() in img_extensions
-        ])
-        self.img_paths = all_imgs[:n_samples]
-        assert len(self.img_paths) > 0, (
-            f"在 {data_dir} 下找不到图片，请检查路径"
-        )
-
-    def __len__(self):
-        return len(self.img_paths)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.img_paths[idx]).convert("RGB")
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text",  "text": "Describe the image."},
-            ],
-        }]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            add_generation_prompt=False,
-        )
-        return {
-            "input_ids":      inputs["input_ids"].squeeze(0),
-            "pixel_values":   inputs["pixel_values"].squeeze(0),
-            "image_grid_thw": inputs["image_grid_thw"].squeeze(0),
-        }
-
-
-def collate_fn(batch):
-    """batch_size=1 的 collate，直接返回第一个元素（保持 tensor shape）。"""
-    assert len(batch) == 1, "校准 DataLoader 必须 batch_size=1"
-    return {
-        "input_ids":      batch[0]["input_ids"].unsqueeze(0),
-        "pixel_values":   batch[0]["pixel_values"].unsqueeze(0),
-        "image_grid_thw": batch[0]["image_grid_thw"].unsqueeze(0),
-    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -128,7 +220,7 @@ def collate_fn(batch):
 def parse_args():
     p = argparse.ArgumentParser(description="MoLAQ 量化流水线")
     p.add_argument("--model",        required=True,  help="模型路径")
-    p.add_argument("--calib_data",   required=True,  help="校准数据目录（flickr30k）")
+    p.add_argument("--calib_data",   required=True,  help="Flickr30k parquet 目录")
     p.add_argument("--output",       required=True,  help="量化后模型保存路径")
     p.add_argument("--enable_A",     action="store_true", help="启用创新点 A")
     p.add_argument("--enable_B",     action="store_true", help="启用创新点 B")
@@ -137,6 +229,8 @@ def parse_args():
     p.add_argument("--bits",         type=int,   default=4,   help="默认量化位数")
     p.add_argument("--group_size",   type=int,   default=128, help="量化分组大小")
     p.add_argument("--n_samples",    type=int,   default=128, help="校准样本数")
+    p.add_argument("--seed",         type=int,   default=42,  help="随机种子")
+    p.add_argument("--max_seq_len",  type=int,   default=2048, help="最大序列长度")
     p.add_argument("--device",       type=str,   default="cuda", help="运行设备")
     return p.parse_args()
 
@@ -155,17 +249,23 @@ def main():
     # ── 加载模型 ────────────────────────────────────────────
     print("[MoLAQ] 加载模型...")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto"
+        args.model, dtype=torch.bfloat16, device_map="auto"
     )
     processor = AutoProcessor.from_pretrained(
         args.model, trust_remote_code=True
     )
 
-    # ── 构建 DataLoader ─────────────────────────────────────
-    dataset    = Flickr30kCalibDataset(args.calib_data, processor, args.n_samples)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False,
-                            collate_fn=collate_fn)
-    print(f"[MoLAQ] 校准样本数: {len(dataset)}")
+    # ── 构建 DataLoader（parquet 格式的真实校准集）──────────────
+    dataset = Flickr30kParquetDataset(
+        data_dir=args.calib_data,
+        processor=processor,
+        n_samples=args.n_samples,
+        seed=args.seed,
+        max_seq_len=args.max_seq_len,
+    )
+    dataloader = DataLoader(
+        dataset, batch_size=1, shuffle=False, collate_fn=collate_fn
+    )
 
     # ── Stage 0+1：一次 forward pass 收集所有统计量 ──────────
     linear_layers = get_linear_layers(model)
@@ -236,10 +336,8 @@ def main():
                 stats.X_raw.float().T @ stats.X_raw.float()
 
         hessian_trace[layer_name] = H.trace().item()
-        delta_4_dict[layer_name]  = estimate_delta(W, bits=4,
-                                        group_size=args.group_size)
-        delta_8_dict[layer_name]  = estimate_delta(W, bits=8,
-                                        group_size=args.group_size)
+        delta_4_dict[layer_name]  = estimate_delta(W, bits=4, group_size=args.group_size)
+        delta_8_dict[layer_name]  = estimate_delta(W, bits=8, group_size=args.group_size)
         param_counts[layer_name]  = W.numel()
 
     # ── 混合精度分配（budget_bits < 8 时生效）──────────────
