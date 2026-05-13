@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 模型权重（体积太大，不进 git）
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 实验大文件
+experiments/logs/*.log
+experiments/results/*.jsonl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# HuggingFace 缓存
+.cache/
+
+# 系统
+.DS_Store
+Thumbs.db
