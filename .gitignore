@@ -6,30 +6,37 @@ dist/
 build/
 .eggs/
 
-# 模型权重（体积太大，不进 git）
-*.safetensors
+# 虚拟环境
+venv/
+env/
+*.egg
+
+# 模型权重（不上传大文件）
 *.bin
 *.pt
 *.pth
-*.gguf
+*.safetensors
 
-# 虚拟环境
-venv/
-.venv/
-env/
+# 实验输出
+outputs/
+results/
+*.log
 
-# 实验大文件
-experiments/logs/*.log
-experiments/results/*.jsonl
+# 临时备份文件
+*.bak_*
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
 
 # IDE
 .vscode/
 .idea/
-*.swp
 
-# HuggingFace 缓存
-.cache/
-
-# 系统
+# OS
 .DS_Store
 Thumbs.db
+
+# configs 中生成的 json 文件（需要时再 git add -f）
+configs/*.json

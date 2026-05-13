@@ -1,21 +1,8 @@
-# Core
+# MoLAQ 依赖
+# 核心依赖已通过 ~/vllm 虚拟环境提供，此处仅列出额外需要确认的包
 torch>=2.1.0
-transformers>=4.40.0
-accelerate>=0.27.0
-
-# Quantization
-llmcompressor>=0.3.0
-
-# Inference
-vllm>=0.4.0
-
-# Evaluation
-lmms-eval
-# VLMEvalKit installed separately: pip install git+https://github.com/open-compass/VLMEvalKit.git
-
-# Utilities
-numpy
-scipy
+transformers>=4.45.0
+pillow
 tqdm
-pyyaml
-rich
+pytest
+# llm-compressor 和 vllm 通过 ~/vllm 虚拟环境提供，无需单独安装

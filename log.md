@@ -1,22 +1,30 @@
 # MoLAQ 开发日志
 
+---
+
 ## 2026-05-13
 
-- 项目初始化：在 `/home/lml/MoLAQ` 下建立完整目录骨架。
-- 创建核心算法包 `molaq/`，包含：
-  - `sensitivity/hessian.py`：Hessian对角近似计算 + 激活收集hook
-  - `sensitivity/saliency.py`：ViT注意力图top-K显著视觉token提取
-  - `sensitivity/modal_gradient.py`：σ_l = tr(H_l)·(||g_lang||_1 + α||g_vis_sal||_1) 实现
-  - `allocation/knapsack.py`：0-1背包贪心求解器（min Σσ_l·Δ_l(b_l)，s.t. bit预算约束）
-  - `allocation/budget.py`：显存/bit预算估算工具
-- 创建 `tests/test_knapsack.py` sanity check。
-- 建立 git 仓库，完成初始提交。
-- **下一步**：补全 GPTQ baseline 评测数据，建立 FP16/AWQ/GPTQ/FP8 四组结果表（Table 1雏形）。
-## 2026-05-13
+### 完成内容
+- 初始化 GitHub 仓库完整骨架，包含所有模块占位文件、README、requirements.txt
+- 完成两轮代码审查，发现并记录 7 处 `.shape` 取 tuple 的静默 bug，已在 v2 文档中全部修正
+- 确认算法可行度 ≈ 99%，理论与工程映射自洽
 
-- 项目初始化：在 `/home/lml/MoLAQ` 下建立完整目录骨架与 git 仓库。
-- 核心算法骨架已创建：hessian.py / saliency.py / modal_gradient.py / knapsack.py / budget.py。
-- README.md 完成（含数学形式化和Quick Start）。
-- sanity check 脚本 tests/test_knapsack.py 已就绪。
-- 完成首次 git commit，推送至 GitHub 备份。
-- **下一步**：运行 test_knapsack.py 验证分配器，然后优先补全 GPTQ baseline 评测结果。
+### 已创建文件
+- `molaq/__init__.py`
+- `molaq/stats/__init__.py` + `modal_stats.py`（待实现）
+- `molaq/core/__init__.py` + `smooth.py` + `weighted_hessian.py` + `saliency_scaling.py`（待实现）
+- `molaq/assign/__init__.py` + `knapsack.py`（待实现）
+- `scripts/run_molaq.py`（骨架）
+- `tests/test_vit_attention.py` + `test_smooth.py` + `test_knapsack.py`（待实现）
+
+### 待处理
+- [ ] 运行 `tests/test_vit_attention.py`，确定 `SALIENCY_MODE`
+- [ ] 实现 `molaq/core/smooth.py` 并通过 `tests/test_smooth.py`
+- [ ] 实现 `molaq/stats/modal_stats.py`（LayerStats + collect_modal_stats）
+- [ ] 实现 `molaq/core/weighted_hessian.py`，逐层打印量化误差
+- [ ] 实现 `molaq/core/saliency_scaling.py`
+- [ ] 实现 `molaq/assign/knapsack.py` 并通过 `tests/test_knapsack.py`
+- [ ] 补全 `scripts/run_molaq.py`（dataloader + get_linear_layers）
+- [ ] 50 样本 MMStar 快速验证
+
+---
