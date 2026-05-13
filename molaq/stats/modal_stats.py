@@ -8,9 +8,9 @@ molaq/stats/modal_stats.py
 
 # ============================================================
 # 根据 tests/test_vit_attention.py 的输出在此处设置（三选一）
-SALIENCY_MODE = "cls_attn"   # 优先方案：有 CLS token
+# SALIENCY_MODE = "cls_attn"   # 优先方案：有 CLS token
 # SALIENCY_MODE = "row_sum"  # 备选方案 1：无 CLS，用被注意度
-# SALIENCY_MODE = "act_norm" # 备选方案 2：无 attention
+SALIENCY_MODE = "act_norm" # 备选方案 2：sdpa 不支持 output_attentions，用激活 L2
 # ============================================================
 
 from dataclasses import dataclass
@@ -48,7 +48,7 @@ def compute_saliency(
     model,
     pixel_values: Tensor,
     image_grid_thw: Tensor,
-    mode: str = "cls_attn",
+    mode: str = "act_norm",
 ) -> Tensor:
     """
     计算视觉 patch 的显著性分数 p_i，满足 sum(p) == 1。
@@ -60,6 +60,11 @@ def compute_saliency(
         mode            : "cls_attn" | "row_sum" | "act_norm"
     Returns:
         p : Tensor [N_patches]
+
+    注意（act_norm 模式）：
+        Qwen3-VL 的 model.visual() 直接返回 Tensor（不是 dataclass），
+        shape 为 [N_patches, hidden_dim]。
+        sdpa attention 不支持 output_attentions=True，因此只能用 act_norm。
     """
     if mode == "cls_attn":
         with torch.no_grad():
@@ -79,9 +84,15 @@ def compute_saliency(
         p = last_attn[0].mean(dim=0).mean(dim=0) # [N_p]
 
     elif mode == "act_norm":
+        # Qwen3-VL visual 返回 Tensor，shape [N_patches, hidden_dim]
         with torch.no_grad():
-            out = model.visual(pixel_values, grid_thw=image_grid_thw)
-        p = out.last_hidden_state[0].float().norm(dim=-1)  # [N_patches]
+            vit_out = model.visual(pixel_values, grid_thw=image_grid_thw)
+        # vit_out 是 Tensor，直接取 L2 范数
+        if isinstance(vit_out, Tensor):
+            p = vit_out.float().norm(dim=-1)   # [N_patches]
+        else:
+            # 兜底：若未来版本返回 dataclass
+            p = vit_out.last_hidden_state[0].float().norm(dim=-1)
 
     else:
         raise ValueError(f"Unknown saliency mode: {mode}")
@@ -273,7 +284,6 @@ def collect_modal_stats(
         h.remove()
 
     # ── 5. 拼接激活，计算每层统计量 ───────────────────────────
-    # 将所有样本的 mask 拼接（每个样本 seq_len 可能不同）
     lang_mask_cat = torch.cat(all_lang_masks, dim=0)  # [N_total]
     sal_mask_cat  = torch.cat(all_sal_masks,  dim=0)
     bg_mask_cat   = torch.cat(all_bg_masks,   dim=0)
@@ -291,7 +301,6 @@ def collect_modal_stats(
         lang_trunc = lang_mask_cat[:N]
         sal_trunc  = sal_mask_cat[:N]
         bg_trunc   = bg_mask_cat[:N]
-        # p_sal 长度 = sal_trunc.sum()
         p_sal_trunc = p_sal_cat[:sal_trunc.sum().item()]
 
         results[name] = compute_stats_for_layer(

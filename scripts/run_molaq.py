@@ -20,6 +20,11 @@ scripts/run_molaq.py — MoLAQ 主调脚本
   --enable_C  : 创新点 C（模态感知预平滑）
   --enable_A  : 创新点 A（加权 Hessian + GPTQ）
   --enable_B  : 创新点 B（显著 token 缩放搜索）
+
+层名说明（Qwen3-VL-2B 实测）：
+  LLM 侧 Linear 层前缀为 model.language_model.layers（不是 model.layers）
+  ViT 侧 Linear 层前缀为 model.visual.blocks
+  本脚本默认只量化 LLM 侧，若需量化 ViT 侧请修改 get_linear_layers。
 """
 
 import argparse
@@ -50,12 +55,14 @@ from molaq.assign.knapsack        import greedy_bit_allocation, estimate_delta
 def get_linear_layers(model) -> List[Tuple[str, torch.nn.Module]]:
     """
     返回 LLM 侧所有 nn.Linear 层的 (name, module) 列表。
-    只处理 model.model.layers（LLM decoder），不对 ViT 做量化。
-    若需要对 ViT 量化，改为 model.named_modules() 并过滤 visual。
+
+    Qwen3-VL-2B 实测层名前缀为 model.language_model.layers，
+    共 196 个 Linear 层（已由 test_vit_attention.py 确认）。
+    不对 ViT 做量化（ViT 层前缀为 model.visual.blocks）。
     """
     result = []
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and "model.layers" in name:
+        if isinstance(module, torch.nn.Linear) and "model.language_model.layers" in name:
             result.append((name, module))
     return result
 
@@ -97,7 +104,6 @@ class Flickr30kCalibDataset(Dataset):
             return_tensors="pt",
             add_generation_prompt=False,
         )
-        # 去掉 batch 维度，DataLoader 会自动加回来
         return {
             "input_ids":      inputs["input_ids"].squeeze(0),
             "pixel_values":   inputs["pixel_values"].squeeze(0),
@@ -146,7 +152,7 @@ def main():
           f"enable_B={args.enable_B}, enable_C={args.enable_C}")
     print(f"[MoLAQ] SALIENCY_MODE={SALIENCY_MODE}")
 
-    # ── 加载模型 ──────────────────────────────────────────────
+    # ── 加载模型 ────────────────────────────────────────────
     print("[MoLAQ] 加载模型...")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
@@ -155,13 +161,13 @@ def main():
         args.model, trust_remote_code=True
     )
 
-    # ── 构建 DataLoader ───────────────────────────────────────
+    # ── 构建 DataLoader ─────────────────────────────────────
     dataset    = Flickr30kCalibDataset(args.calib_data, processor, args.n_samples)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False,
                             collate_fn=collate_fn)
     print(f"[MoLAQ] 校准样本数: {len(dataset)}")
 
-    # ── Stage 0+1：一次 forward pass 收集所有统计量 ───────────
+    # ── Stage 0+1：一次 forward pass 收集所有统计量 ──────────
     linear_layers = get_linear_layers(model)
     target_names  = [name for name, _ in linear_layers]
     print(f"[MoLAQ] 目标 Linear 层数: {len(target_names)}")
@@ -173,7 +179,7 @@ def main():
         device=args.device,
     )
 
-    # ── Stage 2/3/4：逐层量化 ────────────────────────────────
+    # ── Stage 2/3/4：逐层量化 ───────────────────────────────
     hessian_trace: Dict[str, float] = {}
     delta_4_dict:  Dict[str, float] = {}
     delta_8_dict:  Dict[str, float] = {}
@@ -187,9 +193,8 @@ def main():
         W     = module.weight.data.float()
         print(f"[MoLAQ] 量化层: {layer_name}  shape={W.shape}")
 
-        # ── Stage 2 (C) + Stage 3 (A) ────────────────────────
+        # ── Stage 2 (C) + Stage 3 (A) ──────────────────────
         if args.enable_C or args.enable_A:
-            # 三元表达式直接返回向量（不能在外层再取下标）
             smooth_s = (
                 compute_smooth_scale(stats.x_bar, W)
                 if args.enable_C
@@ -204,9 +209,8 @@ def main():
         else:
             W_hat_A = W
 
-        # ── Stage 4 (B) ───────────────────────────────────────
+        # ── Stage 4 (B) ─────────────────────────────────────
         if args.enable_B:
-            # B 的输入权重：enable_A 时用量化结果，否则用浮点原始权重
             W_input_B = W_hat_A if args.enable_A else W
             W_final   = saliency_awq_quantize(
                 W_input_B, stats.X_raw, stats.x_bar,
@@ -219,7 +223,7 @@ def main():
         # 写回权重
         module.weight.data = W_final.to(module.weight.dtype)
 
-        # sanity check（仅在 enable_A 时有意义，skip 否则）
+        # sanity check
         if args.enable_A:
             H = compute_modal_hessian(
                 stats.X_raw.float(),
@@ -231,7 +235,6 @@ def main():
             H = (2.0 / stats.X_raw.shape[0]) * \
                 stats.X_raw.float().T @ stats.X_raw.float()
 
-        # 收集混合精度分配所需统计量
         hessian_trace[layer_name] = H.trace().item()
         delta_4_dict[layer_name]  = estimate_delta(W, bits=4,
                                         group_size=args.group_size)
@@ -239,7 +242,7 @@ def main():
                                         group_size=args.group_size)
         param_counts[layer_name]  = W.numel()
 
-    # ── 混合精度分配（budget_bits < 8 时生效）─────────────────
+    # ── 混合精度分配（budget_bits < 8 时生效）──────────────
     if args.budget_bits < 8.0:
         layer_names = list(all_stats.keys())
         assignment  = greedy_bit_allocation(
@@ -253,7 +256,7 @@ def main():
             json.dump(assignment, f, indent=2)
         print(f"[MoLAQ] bit 分配已保存到 {bit_config_path}")
 
-    # ── 保存量化后模型 ────────────────────────────────────────
+    # ── 保存量化后模型 ──────────────────────────────────────
     os.makedirs(args.output, exist_ok=True)
     model.save_pretrained(args.output)
     processor.save_pretrained(args.output)
