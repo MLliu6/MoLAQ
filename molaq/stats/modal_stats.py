@@ -53,18 +53,9 @@ def compute_saliency(
     """
     计算视觉 patch 的显著性分数 p_i，满足 sum(p) == 1。
 
-    Args:
-        model           : Qwen3VLForConditionalGeneration
-        pixel_values    : 已经过 processor 预处理的像素张量
-        image_grid_thw  : [num_images, 3]，每行 (t, h, w)
-        mode            : "cls_attn" | "row_sum" | "act_norm"
-    Returns:
-        p : Tensor [N_patches]
-
-    注意（act_norm 模式）：
-        Qwen3-VL 的 model.visual() 直接返回 Tensor（不是 dataclass），
-        shape 为 [N_patches, hidden_dim]。
-        sdpa attention 不支持 output_attentions=True，因此只能用 act_norm。
+    Qwen3-VL 实测：model.visual() 返回 tuple，第 0 个元素是
+    shape [N_patches, hidden_dim] 的 Tensor（激活输出）。
+    sdpa attention 不支持 output_attentions=True，因此只能用 act_norm。
     """
     if mode == "cls_attn":
         with torch.no_grad():
@@ -84,15 +75,21 @@ def compute_saliency(
         p = last_attn[0].mean(dim=0).mean(dim=0) # [N_p]
 
     elif mode == "act_norm":
-        # Qwen3-VL visual 返回 Tensor，shape [N_patches, hidden_dim]
         with torch.no_grad():
             vit_out = model.visual(pixel_values, grid_thw=image_grid_thw)
-        # vit_out 是 Tensor，直接取 L2 范数
+        # Qwen3-VL 实测返回 tuple，取第 0 个元素 [N_patches, hidden_dim]
         if isinstance(vit_out, Tensor):
-            p = vit_out.float().norm(dim=-1)   # [N_patches]
+            feat = vit_out
+        elif isinstance(vit_out, tuple):
+            feat = vit_out[0]
+        elif hasattr(vit_out, "last_hidden_state"):
+            feat = vit_out.last_hidden_state[0]
         else:
-            # 兜底：若未来版本返回 dataclass
-            p = vit_out.last_hidden_state[0].float().norm(dim=-1)
+            raise TypeError(
+                f"model.visual() 返回了未知类型 {type(vit_out)}，"
+                "请检查 Qwen3VL ViT 接口"
+            )
+        p = feat.float().norm(dim=-1)  # [N_patches]
 
     else:
         raise ValueError(f"Unknown saliency mode: {mode}")
@@ -156,7 +153,7 @@ def compute_stats_for_layer(
     a = {m: e[m] / e_max for m in e}
 
     # 显著性加权激活幅度 x̄_j [d_in]
-    N = X.shape[0]  # 取行数标量
+    N = X.shape[0]
     w = torch.zeros(N, dtype=torch.float32)
     w[lang_mask] = a["lang"]
     w[bg_mask]   = a["bg"]
@@ -187,18 +184,6 @@ def collect_modal_stats(
 ) -> Dict[str, LayerStats]:
     """
     一次 forward pass 收集所有层的共享统计量。
-
-    Args:
-        model               : Qwen3VLForConditionalGeneration（已 .to(device)）
-        dataloader          : batch_size=1，每 batch 含 pixel_values + input_ids
-                              + image_grid_thw
-        target_layer_names  : 需要统计的 nn.Linear 层名列表
-        processor           : AutoProcessor（用于获取 image_token_id）
-        top_k_ratio         : 显著 token 比例（默认 top-20%）
-        saliency_mode       : 由 test_vit_attention.py 决定
-        device              : "cuda" 或 "cpu"
-    Returns:
-        Dict[layer_name -> LayerStats]
     """
     model.eval()
     model.to(device)
@@ -208,7 +193,7 @@ def collect_modal_stats(
 
     def make_hook(name: str):
         def hook(module, inp, out):
-            x = inp[0].detach().float()         # 取第一个输入；统一 float32
+            x = inp[0].detach().float()
             if x.dim() == 3:
                 x = x.reshape(-1, x.shape[-1])  # [B*seq, d_in]
             storage.setdefault(name, []).append(x.cpu())
@@ -238,7 +223,6 @@ def collect_modal_stats(
 
             # 显著性分数
             p = compute_saliency(model, pixel_values, image_grid_thw, mode=saliency_mode)
-            # p: [N_patches]
 
             # token 分组
             vis_mask, lang_mask = get_token_masks(input_ids, image_token_id)
@@ -247,32 +231,30 @@ def collect_modal_stats(
 
             # top-K 显著 token
             K = max(1, int(top_k_ratio * p.shape[0]))
-            # p 的长度是 N_patches，vis_mask 中 True 的数量应等于 N_patches
             assert n_vis == p.shape[0], (
                 f"vis token 数 {n_vis} != p 长度 {p.shape[0]}，"
                 "请检查 image_grid_thw 和 image_token_id"
             )
             topk_vals, _ = torch.topk(p, K)
             threshold    = topk_vals[-1]
-            sal_vis_mask = (p >= threshold)           # [N_patches] bool
-            bg_vis_mask  = ~sal_vis_mask              # [N_patches] bool
+            sal_vis_mask = (p >= threshold)
+            bg_vis_mask  = ~sal_vis_mask
 
-            # 将 vis patch 级别的掩码展开到 seq 级别
             sal_mask_full = torch.zeros(seq_len, dtype=torch.bool)
             bg_mask_full  = torch.zeros(seq_len, dtype=torch.bool)
             vis_indices   = vis_mask.nonzero(as_tuple=True)[0]
             sal_mask_full[vis_indices[sal_vis_mask]] = True
             bg_mask_full[vis_indices[bg_vis_mask]]   = True
 
-            p_sal = p[sal_vis_mask]  # [K]
-            p_sal = p_sal / (p_sal.sum() + 1e-8)  # 重归一化
+            p_sal = p[sal_vis_mask]
+            p_sal = p_sal / (p_sal.sum() + 1e-8)
 
             all_lang_masks.append(lang_mask.cpu())
             all_sal_masks.append(sal_mask_full.cpu())
             all_bg_masks.append(bg_mask_full.cpu())
             all_p_sal.append(p_sal.cpu())
 
-            # 触发 forward hook（需要完整 forward）
+            # 触发 forward hook
             model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -284,18 +266,17 @@ def collect_modal_stats(
         h.remove()
 
     # ── 5. 拼接激活，计算每层统计量 ───────────────────────────
-    lang_mask_cat = torch.cat(all_lang_masks, dim=0)  # [N_total]
+    lang_mask_cat = torch.cat(all_lang_masks, dim=0)
     sal_mask_cat  = torch.cat(all_sal_masks,  dim=0)
     bg_mask_cat   = torch.cat(all_bg_masks,   dim=0)
-    p_sal_cat     = torch.cat(all_p_sal,      dim=0)  # [sum_K]
+    p_sal_cat     = torch.cat(all_p_sal,      dim=0)
 
     results: Dict[str, LayerStats] = {}
     for name in target_layer_names:
         if name not in storage:
             continue
-        X = torch.cat(storage[name], dim=0).float()   # [N_total, d_in]
+        X = torch.cat(storage[name], dim=0).float()
 
-        # 截断到与 mask 长度一致（部分层 N 可能因 batching 存在微小差异）
         N = min(X.shape[0], lang_mask_cat.shape[0])
         X_trunc    = X[:N]
         lang_trunc = lang_mask_cat[:N]
@@ -306,6 +287,6 @@ def collect_modal_stats(
         results[name] = compute_stats_for_layer(
             X_trunc, lang_trunc, sal_trunc, bg_trunc, p_sal_trunc
         )
-        del storage[name]  # 释放显存
+        del storage[name]
 
     return results
