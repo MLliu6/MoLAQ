@@ -88,3 +88,32 @@
 **下一步：**
 1. 用 `scripts/run_molaq_chunked.py` 在 8 样本上做 sanity，对比显存占用和误差是否一致
 2. 成功后，将其作为 2B/4B 正式 MoLAQ 校准脚本，原脚本保留做对照
+
+### 128 样本正式校准（chunk_size=4, 启用 sanity）✅
+
+**运行配置：**
+- 脚本：`scripts/run_molaq_chunked.py`
+- 校准集：Flickr30k parquet，`n_samples=128`，`max_seq_len=2048`
+- 模型：Qwen3-VL-2B-Instruct（LLM 端 196 个 Linear 层）
+- 参数：`--enable_A --enable_B --enable_C --budget_bits 4.5 --chunk_size 4 --sanity`
+
+**显存曲线：**
+- 专用 GPU 显存在各 chunk 内缓慢上升至 ~8.7GB，然后在 chunk 结束时回落到 ~6GB 左右，整体在 6–9GB 区间波动（RTX 5080 Laptop, 16GB VRAM）。
+- 说明分块调度和 `del all_stats_chunk[...] + torch.cuda.empty_cache()` 生效，每个 chunk 的激活和 Hessian 统计都能被释放。
+
+**量化误差统计（128 样本）：**
+- 前半层：mean ≈ 0.003–0.007，max 主流在 0.05–0.15 之间，与 8 样本一致或略高；
+- 深层（layer 14 之后）：mean 上升至 0.007–0.011，max 主流在 0.2–0.35 区间；
+- 异常层：`layers.27.mlp.down_proj`，mean≈0.0158, max≈0.672（稳定复现），后续考虑强制 INT8。
+
+**κ(H) 条件数（128 样本）：**
+- κ(H_GPTQ) 范围约 10⁵–10¹⁴；
+- κ(H_MoLAQ) 全部落在 ~170–510 区间（个别极端层 ≈ 770），与 8 样本同一数量级；
+- A+C 模块在所有层上将 κ 从 GPTQ 的 10¹¹–10¹⁵ 降到 10²–10³，改善 5–9 个数量级。
+
+**Knapsack bit 分配：**
+- budget=4.50b，achieved=4.506b，INT4=159/196，INT8=37/196，与 8 样本配置保持一致。
+
+**结论：**
+- 基于 128 样本的 MoLAQ Hessian 统计已经稳定：κ(H_MoLAQ) 在所有层上收敛于 O(10²–10³)，量化误差均值 <0.02，问题层可通过后处理强制 INT8。
+- 分块脚本在 16GB GPU 上成功完成 128 样本 + sanity 的全量量化，为后续多模态基准评测提供了可靠的 2B MoLAQ 模型快照 `/home/lml/models/Qwen3-VL-2B-MoLAQ-128-chunked`。
