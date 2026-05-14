@@ -64,8 +64,27 @@
 - 模型权重 ~8.5GB + 激活矩阵（8样本）~4-5GB，峰值约 13-14GB
 - 128 样本正式校准时建议 `--n_samples 64` 或 `--max_seq_len 1024` 控制显存
 
-### 下一步计划
-1. **Phase 1 Baseline**：用 128 样本跑正式 MoLAQ 量化（`--n_samples 128`），关注 layers.27 是否修复
-2. **建立 FP16 / AWQ baseline**：用 llm-compressor 跑 W4A16 AWQ，统一在 MMStar/ScienceQA 上评测
-3. **端到端评测**：MoLAQ vs FP16 vs AWQ，输出 accuracy / VRAM / throughput 对比表
-4. **4B 扩展**：在 2B 实验稳定后扩展到 Qwen3-VL-4B
+### 低显存分块量化脚本（scripts/run_molaq_chunked.py）✅
+
+**动机：** 单次对 196 层全部挂 hook 收集激活，n_samples=64/128 时显存随样本数线性增长，16GB 显卡上直接 OOM。
+
+**方案：**
+- 新增 `scripts/run_molaq_chunked.py`，保持 A/B/C 算法完全不变，只改变调度：
+  - 按 `chunk_size`（默认 4）把 196 个 Linear 层分块
+  - 对每一块：
+    1. 仅对该块的层挂 hook，跑一遍全校准集，调用 `collect_modal_stats` 收集统计量
+    2. 立即对该块的层执行 Stage 2/3/4（C+A+B）量化，并写回权重
+    3. 删除该块的 `all_stats_chunk` 并 `torch.cuda.empty_cache()`
+  - 下一块继续，如此直到全部 196 层完成
+
+**接口：**
+- `--chunk_size`：每次同时收集并量化的层数，默认 4，显存 ~ O(chunk_size)
+- `--sanity`：是否启用每层 κ(H) 的 sanity check（默认关闭以节省显存与时间）
+
+**预期效果：**
+- 8 样本 smoke：峰值显存应明显低于旧脚本的 ~9.9GB
+- 64/128 样本：不再在 Stage 0+1 OOM，可在 16GB 显存卡上完成正式校准
+
+**下一步：**
+1. 用 `scripts/run_molaq_chunked.py` 在 8 样本上做 sanity，对比显存占用和误差是否一致
+2. 成功后，将其作为 2B/4B 正式 MoLAQ 校准脚本，原脚本保留做对照
